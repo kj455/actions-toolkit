@@ -20,7 +20,11 @@ import {
   ITypedResponseWithError,
   ArtifactCacheList
 } from './contracts'
-import {downloadCacheHttpClient, downloadCacheStorageSDK} from './downloadUtils'
+import {
+  downloadCacheHttpClient,
+  downloadCacheStorageS3,
+  downloadCacheStorageSDK
+} from './downloadUtils'
 import {
   DownloadOptions,
   UploadOptions,
@@ -32,6 +36,14 @@ import {
   retryHttpClientResponse,
   retryTypedResponse
 } from './requestUtils'
+import {
+  ListObjectsV2Command,
+  ListObjectsV2CommandInput,
+  S3Client,
+  S3ClientConfig,
+  _Object
+} from '@aws-sdk/client-s3'
+import {Progress, Upload} from '@aws-sdk/lib-storage'
 
 const versionSalt = '1.0'
 
@@ -98,11 +110,81 @@ export function getCacheVersion(
     .digest('hex')
 }
 
+interface _content {
+  Key?: string
+  LastModified?: Date
+}
+
+async function getCacheEntryS3(
+  s3Options: S3ClientConfig,
+  s3BucketName: string,
+  keys: string[],
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _paths: string[]
+): Promise<ArtifactCacheEntry | null> {
+  const primaryKey = keys[0]
+
+  const s3client = new S3Client(s3Options)
+  const param = {
+    Bucket: s3BucketName
+  } as ListObjectsV2CommandInput
+
+  const contents: _content[] = []
+  let hasNext = true
+
+  while (hasNext) {
+    const response = await s3client.send(new ListObjectsV2Command(param))
+    if (!response.Contents) {
+      throw new Error(`Cannot found object in bucket ${s3BucketName}`)
+    }
+
+    const found = response.Contents.find(
+      (content: _Object) => content.Key === primaryKey
+    )
+    if (found && found.LastModified) {
+      return {
+        cacheKey: primaryKey,
+        creationTime: found.LastModified.toString()
+      }
+    }
+
+    hasNext = response.IsTruncated ?? false
+
+    response.Contents.map((obj: _Object) =>
+      contents.push({
+        Key: obj.Key,
+        LastModified: obj.LastModified
+      })
+    )
+  }
+
+  // not found in primary key, So fallback to next keys
+  const notPrimaryKey = keys.slice(1)
+  for (const c of contents) {
+    for (const k of notPrimaryKey) {
+      if (c.Key === k) {
+        return {
+          cacheKey: k,
+          creationTime: c.LastModified?.toString()
+        }
+      }
+    }
+  }
+
+  return null
+}
+
 export async function getCacheEntry(
   keys: string[],
   paths: string[],
-  options?: InternalCacheOptions
+  options?: InternalCacheOptions,
+  s3Options?: S3ClientConfig,
+  s3BucketName?: string
 ): Promise<ArtifactCacheEntry | null> {
+  if (s3Options && s3BucketName) {
+    return await getCacheEntryS3(s3Options, s3BucketName, keys, paths)
+  }
+
   const httpClient = createHttpClient()
   const version = getCacheVersion(
     paths,
@@ -169,7 +251,10 @@ async function printCachesListForDiagnostics(
 export async function downloadCache(
   archiveLocation: string,
   archivePath: string,
-  options?: DownloadOptions
+  options?: DownloadOptions,
+  cacheKey?: string | undefined,
+  s3Options?: S3ClientConfig,
+  s3BucketName?: string
 ): Promise<void> {
   const archiveUrl = new URL(archiveLocation)
   const downloadOptions = getDownloadOptions(options)
@@ -180,6 +265,9 @@ export async function downloadCache(
   ) {
     // Use Azure storage SDK to download caches hosted on Azure to improve speed and reliability.
     await downloadCacheStorageSDK(archiveLocation, archivePath, downloadOptions)
+  }
+  if (s3Options && s3BucketName && cacheKey) {
+    await downloadCacheStorageS3(cacheKey, archivePath, s3Options, s3BucketName)
   } else {
     // Otherwise, download using the Actions http-client.
     await downloadCacheHttpClient(archiveLocation, archivePath)
@@ -260,16 +348,53 @@ async function uploadChunk(
   }
 }
 
+async function uploadFileS3(
+  s3options: S3ClientConfig,
+  s3BucketName: string,
+  archivePath: string,
+  key: string,
+  concurrency: number,
+  maxChunkSize: number
+): Promise<void> {
+  core.debug(`Start upload to S3 (bucket: ${s3BucketName})`)
+
+  const fileStream = fs.createReadStream(archivePath)
+
+  try {
+    const parallelUpload = new Upload({
+      client: new S3Client(s3options),
+      queueSize: concurrency,
+      partSize: maxChunkSize,
+
+      params: {
+        Bucket: s3BucketName,
+        Key: key,
+        Body: fileStream
+      }
+    })
+
+    parallelUpload.on('httpUploadProgress', (progress: Progress) => {
+      core.debug(`Uploading chunk progress: ${JSON.stringify(progress)}`)
+    })
+
+    await parallelUpload.done()
+  } catch (error) {
+    throw new Error(`Cache upload failed because ${error}`)
+  }
+
+  return
+}
+
 async function uploadFile(
   httpClient: HttpClient,
   cacheId: number,
   archivePath: string,
-  options?: UploadOptions
+  key: string,
+  options?: UploadOptions,
+  s3Options?: S3ClientConfig,
+  s3BucketName?: string
 ): Promise<void> {
   // Upload Chunks
-  const fileSize = utils.getArchiveFileSizeInBytes(archivePath)
-  const resourceUrl = getCacheApiUrl(`caches/${cacheId.toString()}`)
-  const fd = fs.openSync(archivePath, 'r')
   const uploadOptions = getUploadOptions(options)
 
   const concurrency = utils.assertDefined(
@@ -284,6 +409,22 @@ async function uploadFile(
   const parallelUploads = [...new Array(concurrency).keys()]
   core.debug('Awaiting all uploads')
   let offset = 0
+
+  if (s3Options && s3BucketName) {
+    await uploadFileS3(
+      s3Options,
+      s3BucketName,
+      archivePath,
+      key,
+      concurrency,
+      maxChunkSize
+    )
+    return
+  }
+
+  const fileSize = utils.getArchiveFileSizeInBytes(archivePath)
+  const resourceUrl = getCacheApiUrl(`caches/${cacheId.toString()}`)
+  const fd = fs.openSync(archivePath, 'r')
 
   try {
     await Promise.all(
@@ -339,12 +480,23 @@ async function commitCache(
 export async function saveCache(
   cacheId: number,
   archivePath: string,
-  options?: UploadOptions
+  key: string,
+  options?: UploadOptions,
+  s3Options?: S3ClientConfig,
+  s3BucketName?: string
 ): Promise<void> {
   const httpClient = createHttpClient()
 
   core.debug('Upload cache')
-  await uploadFile(httpClient, cacheId, archivePath, options)
+  await uploadFile(
+    httpClient,
+    cacheId,
+    archivePath,
+    key,
+    options,
+    s3Options,
+    s3BucketName
+  )
 
   // Commit Cache
   core.debug('Commiting cache')
@@ -353,11 +505,18 @@ export async function saveCache(
     `Cache Size: ~${Math.round(cacheSize / (1024 * 1024))} MB (${cacheSize} B)`
   )
 
-  const commitCacheResponse = await commitCache(httpClient, cacheId, cacheSize)
-  if (!isSuccessStatusCode(commitCacheResponse.statusCode)) {
-    throw new Error(
-      `Cache service responded with ${commitCacheResponse.statusCode} during commit cache.`
+  // already committed on S3
+  if (!s3Options) {
+    const commitCacheResponse = await commitCache(
+      httpClient,
+      cacheId,
+      cacheSize
     )
+    if (!isSuccessStatusCode(commitCacheResponse.statusCode)) {
+      throw new Error(
+        `Cache service responded with ${commitCacheResponse.statusCode} during commit cache.`
+      )
+    }
   }
 
   core.info('Cache saved successfully')

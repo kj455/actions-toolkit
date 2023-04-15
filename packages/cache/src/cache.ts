@@ -4,6 +4,7 @@ import * as utils from './internal/cacheUtils'
 import * as cacheHttpClient from './internal/cacheHttpClient'
 import {createTar, extractTar, listTar} from './internal/tar'
 import {DownloadOptions, UploadOptions} from './options'
+import {S3ClientConfig} from '@aws-sdk/client-s3'
 
 export class ValidationError extends Error {
   constructor(message: string) {
@@ -61,6 +62,8 @@ export function isFeatureAvailable(): boolean {
  * @param restoreKeys an optional ordered list of keys to use for restoring the cache if no cache hit occurred for key
  * @param downloadOptions cache download options
  * @param enableCrossOsArchive an optional boolean enabled to restore on windows any cache created on any platform
+ * @param s3Options upload options for AWS S3
+ * @param s3BucketName a name of AWS S3 bucket
  * @returns string returns the key for the cache hit, otherwise returns undefined
  */
 export async function restoreCache(
@@ -68,7 +71,9 @@ export async function restoreCache(
   primaryKey: string,
   restoreKeys?: string[],
   options?: DownloadOptions,
-  enableCrossOsArchive = false
+  enableCrossOsArchive = false,
+  s3Options?: S3ClientConfig,
+  s3BucketName?: string
 ): Promise<string | undefined> {
   checkPaths(paths)
 
@@ -91,10 +96,16 @@ export async function restoreCache(
   let archivePath = ''
   try {
     // path are needed to compute version
-    const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
-      compressionMethod,
-      enableCrossOsArchive
-    })
+    const cacheEntry = await cacheHttpClient.getCacheEntry(
+      keys,
+      paths,
+      {
+        compressionMethod,
+        enableCrossOsArchive
+      },
+      s3Options,
+      s3BucketName
+    )
     if (!cacheEntry?.archiveLocation) {
       // Cache not found
       return undefined
@@ -115,7 +126,10 @@ export async function restoreCache(
     await cacheHttpClient.downloadCache(
       cacheEntry.archiveLocation,
       archivePath,
-      options
+      options,
+      cacheEntry.cacheKey,
+      s3Options,
+      s3BucketName
     )
 
     if (core.isDebug()) {
@@ -160,13 +174,17 @@ export async function restoreCache(
  * @param key an explicit key for restoring the cache
  * @param enableCrossOsArchive an optional boolean enabled to save cache on windows which could be restored on any platform
  * @param options cache upload options
+ * @param s3Options upload options for AWS S3
+ * @param s3BucketName a name of AWS S3 bucket
  * @returns number returns cacheId if the cache was saved successfully and throws an error if save fails
  */
 export async function saveCache(
   paths: string[],
   key: string,
   options?: UploadOptions,
-  enableCrossOsArchive = false
+  enableCrossOsArchive = false,
+  s3Options?: S3ClientConfig,
+  s3BucketName?: string
 ): Promise<number> {
   checkPaths(paths)
   checkKey(key)
@@ -237,7 +255,14 @@ export async function saveCache(
     }
 
     core.debug(`Saving Cache (ID: ${cacheId})`)
-    await cacheHttpClient.saveCache(cacheId, archivePath, options)
+    await cacheHttpClient.saveCache(
+      cacheId,
+      archivePath,
+      key,
+      options,
+      s3Options,
+      s3BucketName
+    )
   } catch (error) {
     const typedError = error as Error
     if (typedError.name === ValidationError.name) {
